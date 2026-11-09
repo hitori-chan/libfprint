@@ -28,12 +28,14 @@
  * FpiDeviceUdevSubtypeFlags:
  * @FPI_DEVICE_UDEV_SUBTYPE_SPIDEV: The device requires an spidev node
  * @FPI_DEVICE_UDEV_SUBTYPE_HIDRAW: The device requires a hidraw node
+ * @FPI_DEVICE_UDEV_SUBTYPE_MISC: The device requires a misc character device, matched by its name
  *
  * Bitfield of required hardware resources for a udev-backed device.
  */
 typedef enum {
   FPI_DEVICE_UDEV_SUBTYPE_SPIDEV = 1 << 0,
   FPI_DEVICE_UDEV_SUBTYPE_HIDRAW = 1 << 1,
+  FPI_DEVICE_UDEV_SUBTYPE_MISC = 1 << 2,
 } FpiDeviceUdevSubtypeFlags;
 
 /**
@@ -45,6 +47,7 @@ typedef enum {
  * @udev_types: Subtypes for udev-based devices
  * @spi_acpi_id: ACPI ID (for SPI devices)
  * @hid_id: HID device identifier (for HID devices)
+ * @misc_name: The misc device's name, as under /dev (for misc devices)
  *
  * An entry in the table of supported hardware. For USB devices, the product ID
  * and vendor ID should be provided. The optional @driver_data field defaults
@@ -71,6 +74,7 @@ struct _FpIdEntry
         guint pid;
         guint vid;
       } hid_id;
+      const gchar *misc_name;
     };
   };
   guint64 driver_data;

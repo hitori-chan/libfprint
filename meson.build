@@ -150,6 +150,8 @@ drivers_info = {
 
     # SPI driver (non-optional if SPI is available)
     'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },
+    # Apple's Touch ID through the SEP's misc device (Linux only)
+    'apple_sep': { 'helper': ['udev'], 'optional': not have_spi },
 
     # Virtual drivers (test-only, optional)
     'virtual_image': { 'virtual': true, 'helper': ['virtual'], 'optional': true },

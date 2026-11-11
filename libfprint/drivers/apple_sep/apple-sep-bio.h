@@ -18,8 +18,11 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-/* 4: the node from probe, with WAIT; 5: REARM and PRESENCE. A later version only adds requests. */
-#define APPLE_SEP_BIO_VERSION 5
+/*
+ * 4: the node from probe, with WAIT; 5: REARM and PRESENCE; 6: MATCH's EKEYEXPIRED. A later version only adds requests
+ * and answers.
+ */
+#define APPLE_SEP_BIO_VERSION 6
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
@@ -120,7 +123,9 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_LIST _IOWR(APPLE_SEP_BIO_IOC, 0x02, struct apple_sep_bio_list)
 /*
  * For the user the identity file or UNLOCK names (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
- * when the user's component is not loaded; EPERM, MATCH, while the SEP reports the user's matches locked out. ENROL adds
+ * when the user's component is not loaded; EPERM, MATCH, while the SEP reports the user's matches locked out;
+ * EKEYEXPIRED, MATCH, until the user's password is accepted (REARM): after a boot, and after the module's
+ * token_lifetime (48 h) with neither a password nor a match, as macOS asks for it. ENROL adds
  * a finger to the user's loaded component (their kept catacomb LOADed first: EIO for a component the SEP knows but has
  * not loaded, which a fresh context would start anew); a user with none gets a new one.
  */

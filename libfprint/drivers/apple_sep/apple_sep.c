@@ -18,7 +18,9 @@
  * identify finds it in the gallery. An enrolment adds a finger to the user's component (loaded at the session's
  * start); delete removes one identity, then saves the catacombs. While the SEP reports the user's matches locked out
  * (after its failed-match limit), a match fails at once, across boots (the saved lockout record restores it); the
- * host's accepting the user's password re-arms them (the password-accepted signal: REARM, then the record saved).
+ * host's accepting the user's password re-arms them (the password-accepted signal: REARM, then the record saved). As
+ * macOS, a match also fails at once until the password is accepted after a boot, and after the kernel's token_lifetime
+ * (48 h) with neither a password nor a match (interface 6's EKEYEXPIRED).
  *
  * The node is there from the kernel's probe (interface version 4): an operation first WAITs for the SEP's bring-up.
  * Version 5 adds REARM and PRESENCE; on an older kernel they answer ENOTTY and the driver goes without.
@@ -117,6 +119,14 @@ locked_out_error (void)
 {
   return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                    "Touch ID is locked out after too many failed matches: the user's password re-arms it");
+}
+
+/* the driver's EKEYEXPIRED (interface 6): no password since the boot, or none and no match within its token_lifetime */
+static GError *
+password_needed_error (void)
+{
+  return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                   "Touch ID needs your password after a restart or a long time without it");
 }
 
 static GError *
@@ -479,6 +489,8 @@ begin_thread (GTask *task, gpointer source, gpointer data, GCancellable *cancell
     {
       if (action != FPI_DEVICE_ACTION_ENROLL && errno == EPERM)
         g_task_return_error (task, locked_out_error ());
+      else if (action != FPI_DEVICE_ACTION_ENROLL && errno == EKEYEXPIRED)
+        g_task_return_error (task, password_needed_error ());
       else
         g_task_return_error (task, sep_error (action == FPI_DEVICE_ACTION_ENROLL ? "ENROL" : "MATCH"));
       return;

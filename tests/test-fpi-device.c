@@ -3907,6 +3907,15 @@ test_driver_error_types (void)
   error = fpi_device_error_new (i + 1);
   g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL);
   g_test_assert_expected_messages ();
+
+  /* the device errors after the data ones' room */
+  for (i = FP_DEVICE_ERROR_REMOVED; i <= FP_DEVICE_ERROR_PASSWORD_NEEDED; ++i)
+    {
+      g_autoptr(GError) e = fpi_device_error_new (i);
+
+      g_assert_true (g_enum_get_value (errors_enum, i));
+      g_assert_error (e, FP_DEVICE_ERROR, i);
+    }
 }
 
 static void

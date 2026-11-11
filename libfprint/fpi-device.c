@@ -274,6 +274,10 @@ fpi_device_error_new (FpDeviceError error)
       msg = "Device disabled to prevent overheating.";
       break;
 
+    case FP_DEVICE_ERROR_PASSWORD_NEEDED:
+      msg = "The user's password is needed before the next match.";
+      break;
+
     default:
       g_warning ("Unsupported error, returning general error instead!");
       error = FP_DEVICE_ERROR_GENERAL;

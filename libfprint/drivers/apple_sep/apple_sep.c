@@ -117,7 +117,7 @@ boot_id (void)
 static GError *
 locked_out_error (void)
 {
-  return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+  return fpi_device_error_new_msg (FP_DEVICE_ERROR_PASSWORD_NEEDED,
                                    "Touch ID is locked out after too many failed matches: the user's password re-arms it");
 }
 
@@ -125,7 +125,7 @@ locked_out_error (void)
 static GError *
 password_needed_error (void)
 {
-  return fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+  return fpi_device_error_new_msg (FP_DEVICE_ERROR_PASSWORD_NEEDED,
                                    "Touch ID needs your password after a restart or a long time without it");
 }
 

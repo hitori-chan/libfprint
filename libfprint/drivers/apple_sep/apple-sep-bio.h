@@ -19,10 +19,10 @@
 #include <linux/types.h>
 
 /*
- * 4: the node from probe, with WAIT; 5: REARM and PRESENCE; 6: MATCH's EKEYEXPIRED. A later version only adds requests
- * and answers.
+ * 4: the node from probe, with WAIT; 5: REARM and PRESENCE; 6: MATCH's EKEYEXPIRED; 7: CHANGE_SECRET. A later version
+ * only adds requests and answers.
  */
-#define APPLE_SEP_BIO_VERSION 6
+#define APPLE_SEP_BIO_VERSION 7
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
@@ -77,6 +77,19 @@ struct apple_sep_bio_unlock {
 	__u8 uuid[APPLE_SEP_BIO_UUID_LEN];
 	__u8 secret[32];
 	__u64 bag;		/* a pointer: the kept bag, or a BAG_MAX buffer for the new one */
+};
+
+/*
+ * CHANGE_SECRET: UNLOCK's user's secret replaced, as macOS changes a passcode: the SEP rewraps the bag's keys under the
+ * new secret, and the rewrapped bag comes back in bag (a BAG_MAX buffer), its length in bag_len, to keep in place of the
+ * old one with the new secret. The old secret must be the one the session holds (UNLOCK's, or the last change's).
+ */
+struct apple_sep_bio_secret {
+	__u32 uid;
+	__u32 bag_len;		/* out */
+	__u8 old_secret[32];
+	__u8 new_secret[32];
+	__u64 bag;		/* a BAG_MAX buffer */
 };
 
 /* apple_sep_bio_begin.flags, MATCH only */
@@ -170,5 +183,13 @@ struct apple_sep_bio_capture {
  * the bring-up is ready.
  */
 #define APPLE_SEP_BIO_PRESENCE _IOWR(APPLE_SEP_BIO_IOC, 0x0e, struct apple_sep_bio_capture)
+/*
+ * For UNLOCK's user only, the new secret neither zero nor the old (EINVAL otherwise); EBUSY while an operation or a
+ * save is open; EPERM, with nothing sent to the SEP, when old_secret is not the session's (the SEP counts wrong
+ * secrets towards its bag's lock); EIO when the SEP refused the change (the old secret stays); ENODATA when the SEP
+ * took the new secret but its bag did not come back: the session holds the new secret until the reboot, the kept bag
+ * the old one. Not run on a SEP yet.
+ */
+#define APPLE_SEP_BIO_CHANGE_SECRET _IOWR(APPLE_SEP_BIO_IOC, 0x0f, struct apple_sep_bio_secret)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_BIO_H */

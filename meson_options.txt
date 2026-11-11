@@ -34,3 +34,7 @@ option('installed-tests',
        description: 'Whether to install the installed tests',
        type: 'boolean',
        value: true)
+option('apple_sep_pam',
+       description: 'pam_apple_sep, the password as the SEP\'s passcode for apple_sep (named by no PAM file)',
+       type: 'boolean',
+       value: true)

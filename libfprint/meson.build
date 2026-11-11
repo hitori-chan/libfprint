@@ -410,3 +410,14 @@ if get_option('introspection')
     libfprint_gir = libfprint_girtarget[0]
     libfprint_typelib = libfprint_girtarget[1]
 endif
+
+# pam_apple_sep: the password as the SEP's passcode for apple_sep's Touch ID; installed, named by no PAM file
+if 'apple_sep' in drivers and get_option('apple_sep_pam')
+    shared_module('pam_apple_sep',
+        files('drivers/apple_sep/pam_apple_sep.c'),
+        name_prefix: '',
+        include_directories: include_directories('drivers/apple_sep'),
+        dependencies: [glib_dep, dependency('pam'), dependency('libxcrypt')],
+        install: true,
+        install_dir: get_option('libdir') / 'security')
+endif

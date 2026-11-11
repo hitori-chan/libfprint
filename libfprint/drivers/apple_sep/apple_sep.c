@@ -680,6 +680,9 @@ finish_done (GObject *source, GAsyncResult *res, gpointer user)
 static void
 capture_next (FpiDeviceAppleSep *self)
 {
+  /* the sensor waits for a finger from here (fprintd's finger-needed): a prompt offers the finger only then; the
+   * action's end reports none */
+  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NEEDED);
   run (self, capture_thread, NULL, capture_done);
 }
 

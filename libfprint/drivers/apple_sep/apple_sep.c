@@ -281,6 +281,7 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
   g_autofree char *kept = NULL;
   g_autofree char *id_path = identity_path (uid, "bin");
   g_autofree char *bag_path = identity_path (uid, "kb");
+  g_autofree char *pass_path = identity_path (uid, "pass");
   g_autofree char *line = NULL;
   g_autofree guint8 *identity = NULL;
   g_autofree guint8 *bag = NULL;
@@ -308,12 +309,19 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
 
   if (info.state & APPLE_SEP_BIO_UNLOCKED)
     {
-      char kid[64];
+      char kid[64], by[8] = "";
       guint kuid;
 
       if (g_file_get_contents (STATE_DIR "/boot", &kept, NULL, NULL) &&
-          sscanf (kept, "%63s %u", kid, &kuid) == 2 && g_str_equal (kid, boot))
+          sscanf (kept, "%63s %u %7s", kid, &kuid, by) >= 2 && g_str_equal (kid, boot))
         {
+          /* pam_apple_sep's UNLOCK (passcode mode): the kept records are loaded at the first operation after it */
+          if (kuid == uid && g_str_equal (by, "pam"))
+            {
+              load_kept (self, uid);
+              line = g_strdup_printf ("%s %u\n", boot, uid);
+              return write_record (STATE_DIR "/boot", (const guint8 *) line, strlen (line), error);
+            }
           if (kuid == uid)
             return TRUE;
           g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_BUSY,
@@ -322,6 +330,13 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
         }
       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_BUSY,
                    "the SEP's session was unlocked this boot outside this driver");
+      return FALSE;
+    }
+
+  /* passcode mode: only pam_apple_sep unlocks, with the password, once a boot */
+  if (g_file_test (pass_path, G_FILE_TEST_EXISTS))
+    {
+      *error = password_needed_error ();
       return FALSE;
     }
 

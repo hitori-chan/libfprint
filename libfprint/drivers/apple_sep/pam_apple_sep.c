@@ -17,9 +17,10 @@
  * wrong secrets toward a lock of the bag that may be final. The verifier costs an attacker what the shadow hash does.
  *
  * STATE_DIR/identity-UID.bin (UUID, secret or zeros, uid), .kb (the bag), .pass in passcode mode ("SETTING VERIFIER\n",
- * the verifier in hex). After its UNLOCK the module writes STATE_DIR/boot as "BOOT UID pam": apple_sep.c then loads
- * the kept records at its first operation. A change the SEP's secret cannot follow (root's reset with no old password,
- * another session unlocked this boot) changes nothing on the SEP and leaves .stale.
+ * the verifier in hex). apple_sep.c loads the kept records at the user's first operation after its UNLOCK: from
+ * interface 8 it finds the session by SESSIONS; before it the module writes STATE_DIR/boot as "BOOT UID pam". A change
+ * the SEP's secret cannot follow (root's reset with no old password; before interface 8, another user's session
+ * unlocked this boot) changes nothing on the SEP and leaves .stale.
  */
 #define _GNU_SOURCE
 #include <crypt.h>
@@ -137,7 +138,7 @@ checked_secret (guint32 uid, const char *password, guint8 secret[SECRET_LEN])
 }
 
 static int
-open_dev (pam_handle_t *pamh, guint32 *state)
+open_dev (pam_handle_t *pamh, guint32 *state, guint32 *version)
 {
   struct apple_sep_bio_info info = { 0 };
   guint32 wait = READY_WAIT_MS;
@@ -153,6 +154,7 @@ open_dev (pam_handle_t *pamh, guint32 *state)
       return -1;
     }
   *state = info.state;
+  *version = info.version;
   return fd;
 }
 
@@ -164,14 +166,29 @@ boot_id (void)
   return g_file_get_contents (BOOT_ID, &id, NULL, NULL) ? g_strstrip (id) : NULL;
 }
 
-/* whether this boot's session is uid's (apple_sep.c's or this module's STATE_DIR/boot) */
+/*
+ * whether uid's session is unlocked this boot: from interface 8 by SESSIONS; before it, the one session a boot,
+ * named by apple_sep.c's or this module's STATE_DIR/boot
+ */
 static gboolean
-session_is (guint32 uid, guint32 state)
+session_is (int fd, guint32 version, guint32 uid, guint32 state)
 {
   g_autofree char *boot = boot_id ();
   g_autofree char *kept = NULL;
   char kid[64];
   guint kuid;
+
+  if (version >= 8)
+    {
+      struct apple_sep_bio_sessions s = { 0 };
+
+      if (ioctl (fd, APPLE_SEP_BIO_SESSIONS, &s) != 0)
+        return FALSE;
+      for (guint i = 0; i < MIN (s.n, APPLE_SEP_BIO_SESSIONS_MAX); i++)
+        if (s.uid[i] == uid)
+          return TRUE;
+      return FALSE;
+    }
 
   return (state & APPLE_SEP_BIO_UNLOCKED) && boot && g_file_get_contents (STATE_DIR "/boot", &kept, NULL, NULL) &&
          sscanf (kept, "%63s %u", kid, &kuid) == 2 && g_str_equal (kid, boot) && kuid == uid;
@@ -189,9 +206,12 @@ user_uid (pam_handle_t *pamh, guint32 *uid)
   return TRUE;
 }
 
-/* uid's session unlocked with secret and the kept bag, then STATE_DIR/boot for apple_sep.c: once a boot */
+/*
+ * uid's session unlocked with secret and the kept bag, once a boot; before interface 8 then STATE_DIR/boot for
+ * apple_sep.c (from 8 it finds the session by SESSIONS)
+ */
 static gboolean
-unlock_session (pam_handle_t *pamh, int fd, guint32 uid, const guint8 secret[SECRET_LEN])
+unlock_session (pam_handle_t *pamh, int fd, guint32 version, guint32 uid, const guint8 secret[SECRET_LEN])
 {
   struct apple_sep_bio_unlock u = { 0 };
   g_autofree char *id_path = path_of (uid, "bin"), *bag_path = path_of (uid, "kb"), *boot = NULL, *line = NULL;
@@ -222,6 +242,8 @@ unlock_session (pam_handle_t *pamh, int fd, guint32 uid, const guint8 secret[SEC
       pam_syslog (pamh, LOG_ERR, "uid %u: UNLOCK: %s", uid, g_strerror (errno));
       return FALSE;
     }
+  if (version >= 8)
+    return TRUE;
   boot = boot_id ();
   line = g_strdup_printf ("%s %u pam\n", boot ? boot : "?", uid);
   if (!put_file (STATE_DIR "/boot", line, strlen (line)))
@@ -236,7 +258,7 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc, const char **argv)
   g_autofree char *pass_path = NULL;
   guint8 secret[SECRET_LEN];
   const char *tok = NULL;
-  guint32 uid, state;
+  guint32 uid, state, version;
   int fd;
 
   if (!user_uid (pamh, &uid))
@@ -244,9 +266,9 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc, const char **argv)
   pass_path = path_of (uid, "pass");
   if (!g_file_test (pass_path, G_FILE_TEST_EXISTS))
     return PAM_IGNORE;
-  if ((fd = open_dev (pamh, &state)) < 0)
+  if ((fd = open_dev (pamh, &state, &version)) < 0)
     return PAM_IGNORE;
-  if (state & APPLE_SEP_BIO_UNLOCKED)
+  if (version >= 8 ? session_is (fd, version, uid, state) : (state & APPLE_SEP_BIO_UNLOCKED) != 0)
     goto out;
   /* pam_unix's token (asked for when no module before took one) */
   if (pam_get_authtok (pamh, PAM_AUTHTOK, &tok, NULL) != PAM_SUCCESS || !checked_secret (uid, tok, secret))
@@ -255,7 +277,7 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc, const char **argv)
       pam_syslog (pamh, LOG_NOTICE, "uid %u: the password is not the SEP's passcode: no unlock", uid);
       goto out;
     }
-  unlock_session (pamh, fd, uid, secret);
+  unlock_session (pamh, fd, version, uid, secret);
   explicit_bzero (secret, SECRET_LEN);
 out:
   close (fd);
@@ -276,9 +298,9 @@ pam_sm_chauthtok (pam_handle_t *pamh, int flags, int argc, const char **argv)
   g_autofree char *id_path = NULL, *bag_path = NULL, *pass_path = NULL, *stale_path = NULL, *pass = NULL;
   g_autofree guint8 *identity = NULL, *buf = NULL;
   const char *old = NULL, *now = NULL;
-  gboolean want = FALSE, is_pass, ok;
+  gboolean want = FALSE, is_pass, ok, other;
   gsize len = 0;
-  guint32 uid, state;
+  guint32 uid, state, version;
   int fd, r;
 
   if (!(flags & PAM_UPDATE_AUTHTOK) || !user_uid (pamh, &uid))
@@ -294,7 +316,7 @@ pam_sm_chauthtok (pam_handle_t *pamh, int flags, int argc, const char **argv)
     return PAM_IGNORE;
   if (!g_file_get_contents (id_path, (gchar **) &identity, &len, NULL) || len != IDENTITY_LEN)
     return PAM_IGNORE;
-  if ((fd = open_dev (pamh, &state)) < 0)
+  if ((fd = open_dev (pamh, &state, &version)) < 0)
     return PAM_IGNORE;
   /* pam_unix's tokens (asked for when no module before took them); the old one only for a passcode identity */
   if ((is_pass && pam_get_authtok (pamh, PAM_OLDAUTHTOK, &old, NULL) != PAM_SUCCESS) ||
@@ -331,13 +353,13 @@ pam_sm_chauthtok (pam_handle_t *pamh, int flags, int argc, const char **argv)
    * it with the old secret first, so a passcode cannot stay behind the password. Another session this boot (the SEP
    * holds one) leaves a passcode identity behind: marked.
    */
-  if (!session_is (uid, state) &&
-      ((state & APPLE_SEP_BIO_UNLOCKED) || !unlock_session (pamh, fd, uid, s.old_secret)))
+  other = version < 8 && (state & APPLE_SEP_BIO_UNLOCKED);
+  if (!session_is (fd, version, uid, state) && (other || !unlock_session (pamh, fd, version, uid, s.old_secret)))
     {
       if (is_pass)
         put_file (stale_path, "", 0);
       pam_syslog (pamh, LOG_WARNING, "uid %u: %s this boot: the SEP's secret is not changed", uid,
-                  (state & APPLE_SEP_BIO_UNLOCKED) ? "another session is unlocked" : "no unlock");
+                  other ? "another session is unlocked" : "no unlock");
       explicit_bzero (s.old_secret, SECRET_LEN);
       goto out;
     }

@@ -8,9 +8,9 @@
  * user's first enrolment, and the wrapped key bag the SEP returns for it. Linux has no passcode-derived bag as macOS
  * has: the secret is random and root-only.
  *
- * At a boot's first operation: UNLOCK for the operation's user, then every kept catacomb loaded back (the system's
- * first, the user's last) and the lockout record. One user's session a boot: another user's operation fails until a
- * reboot. A print is the identity the SEP names in a match, {uid, UUID}. Each operation ends with the SEP's save:
+ * At a user's first operation of a boot: UNLOCK for them, then the system's catacombs and theirs loaded back (the
+ * system's first) and, at the boot's first, the lockout record. From interface 8 the SEP holds a session for each user
+ * (SESSIONS); before it, one user's session a boot, another user's operation failing until a reboot. A print is the identity the SEP names in a match, {uid, UUID}. Each operation ends with the SEP's save:
  * every record it hands out is on the disk (fsync'd) before the SEP is told so; the lockout record changes with
  * every match, and only the newest loads after a restart.
  *
@@ -209,12 +209,36 @@ component_order (gconstpointer a, gconstpointer b, gpointer user)
   return x < y ? -1 : 1;
 }
 
+/* whether uid's session in the SEP is unlocked this boot (SESSIONS, interface 8) */
+static gboolean
+session_open (FpiDeviceAppleSep *self, guint32 uid, gboolean *open, GError **error)
+{
+  struct apple_sep_bio_sessions s = { 0 };
+
+  if (ioctl (self->fd, APPLE_SEP_BIO_SESSIONS, &s) != 0)
+    {
+      *error = sep_error ("SESSIONS");
+      return FALSE;
+    }
+  *open = FALSE;
+  for (guint i = 0; i < MIN (s.n, APPLE_SEP_BIO_SESSIONS_MAX); i++)
+    *open |= s.uid[i] == uid;
+  return TRUE;
+}
+
+/*
+ * The kept records loaded back at the user's first operation of a boot: the system's catacombs and the user's own
+ * (another user's waits for their session), then the lockout record, one for every user, once a boot
+ * (STATE_DIR/lockout-boot): a later load would put back an older copy over the SEP's.
+ */
 static void
-load_kept (FpiDeviceAppleSep *self, guint32 uid)
+load_kept (FpiDeviceAppleSep *self, guint32 uid, const char *boot)
 {
   g_autoptr(GDir) dir = g_dir_open (STATE_DIR, 0, NULL);
   g_autoptr(GPtrArray) comps = g_ptr_array_new ();
+  g_autoptr(GError) error = NULL;
   g_autofree guint8 *lockout = NULL;
+  g_autofree char *loaded = NULL, *line = NULL;
   const char *name;
   gsize len;
 
@@ -223,7 +247,8 @@ load_kept (FpiDeviceAppleSep *self, guint32 uid)
       gint32 c;
       char end;
 
-      if (sscanf (name, "catacomb-%d.bi%c", &c, &end) == 2 && end == 'n' && g_str_has_suffix (name, ".bin"))
+      if (sscanf (name, "catacomb-%d.bi%c", &c, &end) == 2 && end == 'n' && g_str_has_suffix (name, ".bin") &&
+          (c < 0 || (guint32) c == uid))
         g_ptr_array_add (comps, GINT_TO_POINTER (c));
     }
   g_ptr_array_sort_with_data (comps, component_order, GINT_TO_POINTER (uid));
@@ -256,6 +281,11 @@ load_kept (FpiDeviceAppleSep *self, guint32 uid)
         }
     }
 
+  if (g_file_get_contents (STATE_DIR "/lockout-boot", &loaded, NULL, NULL) && g_str_equal (g_strstrip (loaded), boot))
+    return;
+  line = g_strdup_printf ("%s\n", boot);
+  if (!write_record (STATE_DIR "/lockout-boot", (const guint8 *) line, strlen (line), &error))
+    fp_warn ("%s", error->message);
   if (g_file_get_contents (STATE_DIR "/lockout.bin", (gchar **) &lockout, &len, NULL) && len > 0 &&
       len <= APPLE_SEP_BIO_BLOB_MAX)
     {
@@ -307,7 +337,28 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
       return FALSE;
     }
 
-  if (info.state & APPLE_SEP_BIO_UNLOCKED)
+  /*
+   * Interface 8: a session for each user, SESSIONS naming them; STATE_DIR/loaded-UID names the boot the user's records
+   * were loaded on. A session pam_apple_sep unlocked (passcode mode) has them loaded at its first operation here.
+   */
+  if (self->version >= 8)
+    {
+      gboolean open;
+
+      if (!session_open (self, uid, &open, error))
+        return FALSE;
+      if (open)
+        {
+          g_autofree char *loaded_path = g_strdup_printf (STATE_DIR "/loaded-%u", uid);
+
+          if (g_file_get_contents (loaded_path, &kept, NULL, NULL) && g_str_equal (g_strstrip (kept), boot))
+            return TRUE;
+          load_kept (self, uid, boot);
+          line = g_strdup_printf ("%s\n", boot);
+          return write_record (loaded_path, (const guint8 *) line, strlen (line), error);
+        }
+    }
+  else if (info.state & APPLE_SEP_BIO_UNLOCKED)
     {
       char kid[64], by[8] = "";
       guint kuid;
@@ -318,7 +369,7 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
           /* pam_apple_sep's UNLOCK (passcode mode): the kept records are loaded at the first operation after it */
           if (kuid == uid && g_str_equal (by, "pam"))
             {
-              load_kept (self, uid);
+              load_kept (self, uid, boot);
               line = g_strdup_printf ("%s %u\n", boot, uid);
               return write_record (STATE_DIR "/boot", (const guint8 *) line, strlen (line), error);
             }
@@ -399,8 +450,15 @@ session_prepare (FpiDeviceAppleSep *self, guint32 uid, gboolean create, GError *
   if (made_bag && !write_record (bag_path, buf, u.bag_len, error))
     return FALSE;
 
-  load_kept (self, uid);
+  load_kept (self, uid, boot);
 
+  if (self->version >= 8)
+    {
+      g_autofree char *loaded_path = g_strdup_printf (STATE_DIR "/loaded-%u", uid);
+
+      line = g_strdup_printf ("%s\n", boot);
+      return write_record (loaded_path, (const guint8 *) line, strlen (line), error);
+    }
   line = g_strdup_printf ("%s %u\n", boot, uid);
   return write_record (STATE_DIR "/boot", (const guint8 *) line, strlen (line), error);
 }

@@ -19,10 +19,10 @@
 #include <linux/types.h>
 
 /*
- * 4: the node from probe, with WAIT; 5: REARM and PRESENCE; 6: MATCH's EKEYEXPIRED; 7: CHANGE_SECRET. A later version
- * only adds requests and answers.
+ * 4: the node from probe, with WAIT; 5: REARM and PRESENCE; 6: MATCH's EKEYEXPIRED; 7: CHANGE_SECRET; 8: a session for
+ * each user (UNLOCK once a boot per user, SESSIONS). A later version only adds requests and answers.
  */
-#define APPLE_SEP_BIO_VERSION 7
+#define APPLE_SEP_BIO_VERSION 8
 #define APPLE_SEP_BIO_UUID_LEN 16
 #define APPLE_SEP_BIO_LIST_MAX 16
 #define APPLE_SEP_BIO_BLOB_MAX 0x500000
@@ -67,7 +67,7 @@ struct apple_sep_bio_list {
 };
 
 /*
- * UNLOCK: the user's identity, once a boot, which unlocks their session in the SEP. bag_len 0 asks the SEP to make
+ * UNLOCK: a user's identity, once a boot for each user, which unlocks their session in the SEP. bag_len 0 asks the SEP to make
  * the wrapped bag: it comes back in bag (a BAG_MAX buffer) with its length in bag_len, to keep with the identity and
  * give back after a restart. The identity is the caller's to keep secret.
  */
@@ -80,7 +80,7 @@ struct apple_sep_bio_unlock {
 };
 
 /*
- * CHANGE_SECRET: UNLOCK's user's secret replaced, as macOS changes a passcode: the SEP rewraps the bag's keys under the
+ * CHANGE_SECRET: a user's secret replaced, as macOS changes a passcode: the SEP rewraps the bag's keys under the
  * new secret, and the rewrapped bag comes back in bag (a BAG_MAX buffer), its length in bag_len, to keep in place of the
  * old one with the new secret. The old secret must be the one the session holds (UNLOCK's, or the last change's).
  */
@@ -135,7 +135,7 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_LOAD _IOWR(APPLE_SEP_BIO_IOC, 0x01, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_LIST _IOWR(APPLE_SEP_BIO_IOC, 0x02, struct apple_sep_bio_list)
 /*
- * For the user the identity file or UNLOCK names (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
+ * For a user whose session is unlocked: the identity file's, or one UNLOCK opened (EINVAL otherwise). EBUSY while an operation or a save is open; ENOENT, MATCH,
  * when the user's component is not loaded; EPERM, MATCH, while the SEP reports the user's matches locked out;
  * EKEYEXPIRED, MATCH, until the user's password is accepted (REARM): after a boot, and after the module's
  * token_lifetime (48 h) with neither a password nor a match, as macOS asks for it. ENROL adds
@@ -158,13 +158,13 @@ struct apple_sep_bio_capture {
 #define APPLE_SEP_BIO_SAVE_NEXT _IOWR(APPLE_SEP_BIO_IOC, 0x07, struct apple_sep_bio_blob)
 #define APPLE_SEP_BIO_SAVE_CONFIRM _IO(APPLE_SEP_BIO_IOC, 0x08)
 #define APPLE_SEP_BIO_CANCEL _IO(APPLE_SEP_BIO_IOC, 0x09)
-/* EALREADY after one this boot; ENOTTY below the driver's stage 17; EIO when the SEP refused a step (the identity is
- * then spent until a reboot) */
+/* EALREADY after the uid's this boot; ENOSPC with APPLE_SEP_BIO_SESSIONS_MAX sessions unlocked; ENOTTY below the
+ * driver's stage 17; EIO when the SEP refused a step (the identity is then spent until a reboot) */
 #define APPLE_SEP_BIO_UNLOCK _IOWR(APPLE_SEP_BIO_IOC, 0x0a, struct apple_sep_bio_unlock)
 /* blocks until the bring-up has ended, at most timeout_ms (1 to 120000): 0 READY; ENODEV when it stopped; ETIMEDOUT */
 #define APPLE_SEP_BIO_WAIT _IOW(APPLE_SEP_BIO_IOC, 0x0b, __u32)
 /*
- * One of the session user's identities removed (stage 17): then a save of the catacombs only (no lockout record),
+ * One identity of a user whose session is unlocked removed (stage 17): then a save of the catacombs only (no lockout record),
  * SAVE_NEXT and SAVE_CONFIRM until ENODATA. ENOENT when the SEP refuses it; EBUSY while an operation or a save is open.
  */
 #define APPLE_SEP_BIO_DELETE _IOW(APPLE_SEP_BIO_IOC, 0x0c, struct apple_sep_bio_identity)
@@ -172,7 +172,7 @@ struct apple_sep_bio_capture {
  * Once the host has accepted the user's password (the SEP does not see it): the session's unlock sent again with the
  * identity's secret, as macOS's lock screen sends it after the password, which clears the SEP's lockout of the user's
  * matches. It opens a save of the lockout record alone (SAVE_NEXT, SAVE_CONFIRM): the kept record would restore the
- * lockout when it is loaded at the next boot. For UNLOCK's user only (EINVAL otherwise); EBUSY while an operation or a
+ * lockout when it is loaded at the next boot. For a user UNLOCK opened only (EINVAL otherwise); EBUSY while an operation or a
  * save is open; EIO when the SEP refused it.
  */
 #define APPLE_SEP_BIO_REARM _IOW(APPLE_SEP_BIO_IOC, 0x0d, __u32)
@@ -184,12 +184,20 @@ struct apple_sep_bio_capture {
  */
 #define APPLE_SEP_BIO_PRESENCE _IOWR(APPLE_SEP_BIO_IOC, 0x0e, struct apple_sep_bio_capture)
 /*
- * For UNLOCK's user only, the new secret neither zero nor the old (EINVAL otherwise); EBUSY while an operation or a
+ * For a user UNLOCK opened only, the new secret neither zero nor the old (EINVAL otherwise); EBUSY while an operation or a
  * save is open; EPERM, with nothing sent to the SEP, when old_secret is not the session's (the SEP counts wrong
  * secrets towards its bag's lock); EIO when the SEP refused the change (the old secret stays); ENODATA when the SEP
  * took the new secret but its bag did not come back: the session holds the new secret until the reboot, the kept bag
  * the old one. Not run on a SEP yet.
  */
 #define APPLE_SEP_BIO_CHANGE_SECRET _IOWR(APPLE_SEP_BIO_IOC, 0x0f, struct apple_sep_bio_secret)
+
+/* SESSIONS (version 8): the uids whose sessions UNLOCK opened this boot, in their order */
+#define APPLE_SEP_BIO_SESSIONS_MAX 8
+struct apple_sep_bio_sessions {
+	__u32 n;
+	__u32 uid[APPLE_SEP_BIO_SESSIONS_MAX];
+};
+#define APPLE_SEP_BIO_SESSIONS _IOR(APPLE_SEP_BIO_IOC, 0x14, struct apple_sep_bio_sessions)
 
 #endif /* _UAPI_LINUX_APPLE_SEP_BIO_H */

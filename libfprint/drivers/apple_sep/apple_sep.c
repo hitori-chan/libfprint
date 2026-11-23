@@ -1199,6 +1199,25 @@ apple_sep_cancel (FpDevice *dev)
     fp_warn ("CANCEL: %s", g_strerror (errno));
 }
 
+/*
+ * fprintd keeps a device's fingers under its id (/var/lib/fprint/USER/apple_sep/ID) and takes only the prints that
+ * carry it, so the id makes the list of fingers the OS's, as its records are: under another OS the SEP has none of
+ * them, and fprintd's check of a new finger against them (an identify before an enrolment) would fail at its start.
+ * The OS records-os names, or no OS UUID: libfprint's default "0", which the fingers enrolled before were kept under;
+ * another OS: os-HEX.
+ */
+static void
+apple_sep_probe (FpDevice *dev)
+{
+  g_autofree char *hex = os_uuid_hex ();
+  g_autofree char *owner = NULL;
+  g_autofree char *id = NULL;
+
+  if (hex && !(g_file_get_contents (RECORDS_OS, &owner, NULL, NULL) && g_str_equal (g_strstrip (owner), hex)))
+    id = g_strdup_printf ("os-%s", hex);
+  fpi_device_probe_complete (dev, id, NULL, NULL);
+}
+
 static void
 apple_sep_open (FpDevice *dev)
 {
@@ -1259,6 +1278,7 @@ fpi_device_apple_sep_class_init (FpiDeviceAppleSepClass *klass)
   dev_class->nr_enroll_stages = ENROLL_STAGES;
   dev_class->temp_hot_seconds = -1;
 
+  dev_class->probe = apple_sep_probe;
   dev_class->open = apple_sep_open;
   dev_class->close = apple_sep_close;
   dev_class->enroll = apple_sep_enroll;

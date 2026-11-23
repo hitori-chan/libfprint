@@ -3,8 +3,9 @@
  * Apple Touch ID on the M3 MacBook Pros, through the SEP: the kernel's /dev/apple-sep-bio (drivers/soc/apple/sep).
  *
  * Match on chip: the SEP enrols and matches, and seals for the host what the host keeps across a restart: each
- * component's catacomb (a user's, the system's -1) and the lockout record. They live in STATE_DIR beside each user's
- * identity, which unlocks that user's session in the SEP once a boot (UNLOCK): its UUID and secret, made at the
+ * component's catacomb (a user's, the system's -1) and the lockout record. They live in a directory for the OS
+ * (records_dir), each user's identity in STATE_DIR: it unlocks that user's session in the SEP once a boot
+ * (UNLOCK), with its UUID and secret, made at the
  * user's first enrolment, and the wrapped key bag the SEP returns for it. Linux has no passcode-derived bag as macOS
  * has: the secret is random and root-only.
  *
@@ -96,10 +97,121 @@ identity_path (guint32 uid, const char *ext)
   return g_strdup_printf (STATE_DIR "/identity-%u.%s", uid, ext);
 }
 
+/*
+ * The SEP keeps a user's anti-replay state for each OS: each boot stub's bring-up reads its own user root record from
+ * the xART store, the SEP's being shared (on this Mac slot 2 under the 14.8.3 stub, slot 10 under the 27.2 one), and
+ * the catacombs and lockout record sealed under one OS are not taken under another, as macOS keeps a Touch ID
+ * enrolment for each install. So they live in a directory for the OS the SEP was told of, the SEP node's
+ * apple,os-uuid (m1n1's, from /chosen/apfs-preboot-uuid): STATE_DIR/os-HEX. The identity, its bag and STATE_DIR/boot
+ * stay shared: the bag unlocks under every stub, and pam_apple_sep and the initramfs read them there. With no OS
+ * UUID (an older kernel or loader) the records stay in STATE_DIR, as before.
+ *
+ * STATE_DIR's own records are those of the OS STATE_DIR/records-os names (its HEX, written by hand once): its
+ * directory, when first made, gets copies of them. No other OS takes them, whichever boots first.
+ */
+#define RECORDS_OS STATE_DIR "/records-os"
+
+static const char *const flat_records[] = {
+  "lockout.bin", "lockout.bin.prev", "lockout-boot",
+};
+
+static char *
+os_uuid_hex (void)
+{
+  g_autoptr(GDir) soc = g_dir_open ("/proc/device-tree/soc", 0, NULL);
+  const char *name;
+
+  while (soc && (name = g_dir_read_name (soc)))
+    {
+      g_autofree char *path = NULL;
+      g_autofree guint8 *uuid = NULL;
+      gsize len;
+
+      if (!g_str_has_prefix (name, "sep@"))
+        continue;
+      path = g_strdup_printf ("/proc/device-tree/soc/%s/apple,os-uuid", name);
+      if (g_file_get_contents (path, (gchar **) &uuid, &len, NULL) && len == 16)
+        {
+          GString *hex = g_string_sized_new (32);
+
+          for (gsize i = 0; i < len; i++)
+            g_string_append_printf (hex, "%02x", uuid[i]);
+          return g_string_free (hex, FALSE);
+        }
+    }
+  return NULL;
+}
+
+static void
+copy_record (const char *from_dir, const char *to_dir, const char *name)
+{
+  g_autofree char *from = g_build_filename (from_dir, name, NULL);
+  g_autofree char *to = g_build_filename (to_dir, name, NULL);
+  g_autofree gchar *data = NULL;
+  g_autoptr(GError) error = NULL;
+  gsize len;
+
+  if (!g_file_get_contents (from, &data, &len, NULL))
+    return;
+  if (!g_file_set_contents_full (to, data, len, G_FILE_SET_CONTENTS_CONSISTENT | G_FILE_SET_CONTENTS_DURABLE, 0600,
+                                 &error))
+    fp_warn ("%s", error->message);
+}
+
+/* this OS's directory for the catacombs and the lockout record, made (and given STATE_DIR's if they are its) once */
+static const char *
+records_dir (void)
+{
+  static char *dir;
+  g_autofree char *hex = NULL, *owner = NULL;
+
+  if (dir)
+    return dir;
+  hex = os_uuid_hex ();
+  if (!hex)
+    return dir = g_strdup (STATE_DIR);
+  dir = g_strdup_printf (STATE_DIR "/os-%s", hex);
+  if (g_file_test (dir, G_FILE_TEST_IS_DIR))
+    return dir;
+  if (g_mkdir_with_parents (dir, 0700) != 0)
+    {
+      fp_warn ("%s: %s", dir, g_strerror (errno));
+      g_clear_pointer (&dir, g_free);
+      return dir = g_strdup (STATE_DIR);
+    }
+  if (g_file_get_contents (RECORDS_OS, &owner, NULL, NULL) && g_str_equal (g_strstrip (owner), hex))
+    {
+      g_autoptr(GDir) flat = g_dir_open (STATE_DIR, 0, NULL);
+      const char *name;
+
+      while (flat && (name = g_dir_read_name (flat)))
+        if (g_str_has_prefix (name, "catacomb-") &&
+            (g_str_has_suffix (name, ".bin") || g_str_has_suffix (name, ".bin.prev")))
+          copy_record (STATE_DIR, dir, name);
+      for (guint i = 0; i < G_N_ELEMENTS (flat_records); i++)
+        copy_record (STATE_DIR, dir, flat_records[i]);
+      fp_info ("this OS's records: %s, from %s's", dir, STATE_DIR);
+    }
+  else
+    fp_info ("this OS's records: %s, none kept yet", dir);
+  return dir;
+}
+
 static char *
 catacomb_path (gint32 component)
 {
-  return g_strdup_printf (STATE_DIR "/catacomb-%d.bin", component);
+  return g_strdup_printf ("%s/catacomb-%d.bin", records_dir (), component);
+}
+
+/*
+ * A catacomb the SEP calls corrupted (biometrickitd's performLoadCatacombCommand:inData: turns bits 1-15 of 0x4001,
+ * or 0x192, into the error loadCatacombForComponent: reports before it drops the file: rda biometrickitd_272
+ * 0x1000253c8; the kernel's load_refused). Any other status leaves the record where it is.
+ */
+static gboolean
+load_refused (guint32 status)
+{
+  return (status >> 1) == 0x4001 || status == 0x192;
 }
 
 static char *
@@ -229,16 +341,18 @@ session_open (FpiDeviceAppleSep *self, guint32 uid, gboolean *open, GError **err
 /*
  * The kept records loaded back at the user's first operation of a boot: the system's catacombs and the user's own
  * (another user's waits for their session), then the lockout record, one for every user, once a boot
- * (STATE_DIR/lockout-boot): a later load would put back an older copy over the SEP's.
+ * (the OS's lockout-boot): a later load would put back an older copy over the SEP's.
  */
 static void
 load_kept (FpiDeviceAppleSep *self, guint32 uid, const char *boot)
 {
-  g_autoptr(GDir) dir = g_dir_open (STATE_DIR, 0, NULL);
+  g_autoptr(GDir) dir = g_dir_open (records_dir (), 0, NULL);
   g_autoptr(GPtrArray) comps = g_ptr_array_new ();
   g_autoptr(GError) error = NULL;
   g_autofree guint8 *lockout = NULL;
   g_autofree char *loaded = NULL, *line = NULL;
+  g_autofree char *lockout_boot = g_build_filename (records_dir (), "lockout-boot", NULL);
+  g_autofree char *lockout_path = g_build_filename (records_dir (), "lockout.bin", NULL);
   const char *name;
   gsize len;
 
@@ -269,7 +383,7 @@ load_kept (FpiDeviceAppleSep *self, guint32 uid, const char *boot)
           if (errno != EALREADY)
             fp_warn ("component %d not loaded: %s", c, g_strerror (errno));
         }
-      else if (b.status != 0)
+      else if (load_refused (b.status))
         {
           /* the component is now active and empty, and the next save would replace the kept record with it:
            * keep the refused one aside (biometrickitd deletes it) */
@@ -279,14 +393,16 @@ load_kept (FpiDeviceAppleSep *self, guint32 uid, const char *boot)
           if (g_rename (path, aside) != 0)
             fp_warn ("%s: %s", aside, g_strerror (errno));
         }
+      else if (b.status != 0)
+        fp_warn ("component %d loaded with status 0x%x: the record kept", c, b.status);
     }
 
-  if (g_file_get_contents (STATE_DIR "/lockout-boot", &loaded, NULL, NULL) && g_str_equal (g_strstrip (loaded), boot))
+  if (g_file_get_contents (lockout_boot, &loaded, NULL, NULL) && g_str_equal (g_strstrip (loaded), boot))
     return;
   line = g_strdup_printf ("%s\n", boot);
-  if (!write_record (STATE_DIR "/lockout-boot", (const guint8 *) line, strlen (line), &error))
+  if (!write_record (lockout_boot, (const guint8 *) line, strlen (line), &error))
     fp_warn ("%s", error->message);
-  if (g_file_get_contents (STATE_DIR "/lockout.bin", (gchar **) &lockout, &len, NULL) && len > 0 &&
+  if (g_file_get_contents (lockout_path, (gchar **) &lockout, &len, NULL) && len > 0 &&
       len <= APPLE_SEP_BIO_BLOB_MAX)
     {
       struct apple_sep_bio_blob b = { .kind = APPLE_SEP_BIO_LOCKOUT, .len = len, .data = (guintptr) lockout };
@@ -484,7 +600,7 @@ save_records (FpiDeviceAppleSep *self, GError **error)
       if (b.kind == APPLE_SEP_BIO_CATACOMB)
         path = catacomb_path (b.component);
       else if (b.kind == APPLE_SEP_BIO_LOCKOUT)
-        path = g_strdup (STATE_DIR "/lockout.bin");
+        path = g_build_filename (records_dir (), "lockout.bin", NULL);
       else
         {
           g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO, "SAVE_NEXT: a record of kind %u", b.kind);
